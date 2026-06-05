@@ -77,7 +77,33 @@ python main.py --address AA:BB:CC:DD:EE:FF
  11) Read total activity (30 days)
  12) Read HRV records
  13) ★ Full dump (all data → JSON)
+ 21) Scheduled HR every 5 min (0x2A + 0x55)
 ```
+
+### Adquisición programada de frecuencia cardíaca
+
+Selecciona la opción `21` para:
+
+1. Sincronizar el reloj del brazalete.
+2. Configurar `0x2A` en modo intervalo, cada 5 minutos, todo el día.
+3. Esperar 1 minuto para la primera toma.
+4. Consultar `0x55` cada minuto para recuperar rápidamente cada medición terminada.
+5. Recibir la descarga histórica de `0x55` y guardar solo timestamps nuevos.
+
+Pulsa `Enter` para detener el monitor y volver al menú. La programación de
+5 minutos permanece activa en el brazalete.
+
+Los resultados se guardan en:
+
+```text
+data/scheduled_hr_records.jsonl
+data/scheduled_hr_state.json
+```
+
+El primer archivo contiene las mediciones. El segundo mantiene el último
+timestamp confirmado para evitar duplicados y reanudar la lectura. Los IDs de
+`0x55` son posiciones relativas: el registro más reciente vuelve a ser ID `0`
+en cada consulta.
 
 ### Dump completo directo
 
@@ -123,6 +149,7 @@ wristband2501/
 | Dato | Comando | Descripción |
 |------|---------|-------------|
 | Frecuencia cardíaca | `0x54` / `0x28` | Histórico por minuto + tiempo real |
+| HR programada | `0x2A` / `0x55` | Configuración cada 5 min + lectura incremental |
 | SpO2 (oxígeno) | `0x66` / `0x28` | Histórico + tiempo real |
 | Pasos diarios | `0x51` | Totales por día, 30 días |
 | Detalle de pasos | `0x52` | Por bloques de 10 minutos |

@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 logs/
 .wristband_address
+data/scheduled_hr_records.jsonl
+data/scheduled_hr_state.json

@@ -6,12 +6,14 @@ Uses the `bleak` library for Linux BLE communication.
 import asyncio
 import logging
 import json
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Callable
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
+from bleak.exc import BleakError
 
 from protocol import (
     pkt_set_auto_measure, pkt_get_auto_measure,
@@ -25,14 +27,16 @@ from protocol import (
     pkt_real_time_steps, pkt_start_heart_rate, pkt_stop_heart_rate,
     pkt_start_spo2, pkt_stop_spo2, pkt_start_hrv,
     pkt_get_total_steps, pkt_get_step_detail,
-    pkt_get_sleep, pkt_get_heart_rate_data,
+    pkt_get_sleep, pkt_get_heart_rate_data, pkt_get_single_heart_rate,
     pkt_get_blood_oxygen, pkt_get_hrv,
     parse_battery, parse_time, parse_realtime_steps, parse_health_measure,
     parse_total_steps, parse_step_detail, parse_sleep,
-    parse_heart_rate_data, parse_blood_oxygen, parse_hrv, parse_hrv_multi,
+    parse_heart_rate_data, parse_single_heart_rate_multi,
+    parse_blood_oxygen, parse_hrv, parse_hrv_multi,
     CMD_HEALTH_MEASURE, CMD_REAL_TIME_STEPS,
     CMD_GET_TOTAL_STEPS, CMD_GET_STEP_DETAIL, CMD_GET_SLEEP,
-    CMD_GET_HEART_RATE, CMD_GET_BLOOD_OXYGEN, CMD_GET_HRV, HRV_RECORD_SIZE,
+    CMD_GET_HEART_RATE, CMD_GET_SINGLE_HR,
+    CMD_GET_BLOOD_OXYGEN, CMD_GET_HRV, HRV_RECORD_SIZE,
 )
 
 logging.basicConfig(
@@ -57,11 +61,18 @@ class WristbandClient:
     """
 
     RESPONSE_TIMEOUT = 8.0  # seconds to wait for a device response
+    SCHEDULED_HR_INTERVAL_MINUTES = 5
+    SCHEDULED_HR_FIRST_WAIT_SECONDS = 60
+    SCHEDULED_HR_POLL_SECONDS = 60
+    SCHEDULED_HR_BURST_SILENCE_SECONDS = 0.75
 
     def __init__(self, address: str, data_dir: str = "data"):
         self.address   = address
         self.data_dir  = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
+        self._scheduled_hr_records_file = self.data_dir / "scheduled_hr_records.jsonl"
+        self._scheduled_hr_state_file = self.data_dir / "scheduled_hr_state.json"
+        self._scheduled_hr_keys: Optional[set[tuple[str, str]]] = None
         self._client: Optional[BleakClient] = None
         self._response_queue: asyncio.Queue = asyncio.Queue()
         self._notify_handlers: dict[int, Callable] = {}
@@ -81,6 +92,32 @@ class WristbandClient:
             await self._client.disconnect()
             log.info("Disconnected.")
 
+    async def _reconnect_until_connected(self, retry_seconds: int = 10) -> None:
+        """Reconnect indefinitely; cancellation stops the retry loop."""
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                if self._client and self._client.is_connected:
+                    return
+                if self._client:
+                    try:
+                        await self._client.disconnect()
+                    except Exception:
+                        pass
+                self._client = None
+                log.info(f"Reconnecting to wristband (attempt {attempt})...")
+                await self.connect()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    f"Reconnect attempt {attempt} failed: {exc}. "
+                    f"Retrying in {retry_seconds}s."
+                )
+                await asyncio.sleep(retry_seconds)
+
     async def __aenter__(self):
         await self.connect()
         return self
@@ -92,6 +129,24 @@ class WristbandClient:
     def _on_notify(self, _sender, data: bytearray):
         """Called whenever the device sends a notification."""
         raw = bytes(data)
+        if not raw:
+            return
+
+        # Firmware 2501 streams 0x55 history as a burst of 10-byte records.
+        # These packets have no packet CRC, and logging their full payload at
+        # INFO produces thousands of bytes per query.
+        if raw[0] == CMD_GET_SINGLE_HR:
+            if len(raw) == 2 and raw[1] == 0xFF:
+                log.info("← No scheduled HR data on device")
+            else:
+                record_count = len(parse_single_heart_rate_multi(raw))
+                log.debug(
+                    f"← RX [{len(raw)}b] cmd=0x55 "
+                    f"records={record_count}"
+                )
+            self._response_queue.put_nowait(raw)
+            return
+
         # Always log raw bytes at INFO so we can diagnose CRC issues
         expected_crc = sum(raw[:-1]) & 0xFF
         log.info(
@@ -105,15 +160,14 @@ class WristbandClient:
             self._response_queue.put_nowait(raw)
             return
 
-        # PPI (0x64) and HRV (0x56) packets contain concatenated records with NO per-packet CRC.
-        # Pass directly to queue without CRC check.
+        # Stored-data packets can contain concatenated records with no packet CRC.
+        # Pass them directly to the response queue.
         if raw[0] == CMD_GET_PPI and len(raw) >= PPI_RECORD_SIZE:
             self._response_queue.put_nowait(raw)
             return
         if raw[0] == CMD_GET_HRV and len(raw) >= HRV_RECORD_SIZE:
             self._response_queue.put_nowait(raw)
             return
-
         if not verify_packet(raw):
             log.warning(
                 f"CRC mismatch on cmd={raw[0]:#04x} len={len(raw)} — "
@@ -189,6 +243,222 @@ class WristbandClient:
             parser=parse_heart_rate_data,
             label="Heart Rate"
         )
+
+    async def get_scheduled_heart_rate_history(self) -> list:
+        """
+        Read the complete 0x55 history burst.
+
+        On the observed 2501 firmware, mode 0x00 streams the complete history
+        automatically in 240-byte notifications. IDs are positions relative to
+        the newest record and shift whenever a new measurement is added.
+        """
+        if not self._client or not self._client.is_connected:
+            raise RuntimeError("Not connected")
+
+        while not self._response_queue.empty():
+            self._response_queue.get_nowait()
+
+        packet = pkt_get_single_heart_rate(mode=0x00)
+        log.debug(f"→ TX: {packet.hex(' ')}")
+        await self._client.write_gatt_char(TX_UUID, packet, response=False)
+
+        records = []
+        packet_count = 0
+        first_packet = True
+        while True:
+            timeout = (
+                self.RESPONSE_TIMEOUT
+                if first_packet
+                else self.SCHEDULED_HR_BURST_SILENCE_SECONDS
+            )
+            try:
+                raw = await asyncio.wait_for(
+                    self._response_queue.get(),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                if first_packet:
+                    raise TimeoutError(
+                        f"No response for command 0x55 within "
+                        f"{self.RESPONSE_TIMEOUT}s"
+                    )
+                break
+
+            if not raw or raw[0] != CMD_GET_SINGLE_HR:
+                continue
+            first_packet = False
+            if self._is_no_data(raw):
+                break
+
+            packet_count += 1
+            records.extend(
+                _dataclass_to_dict(record)
+                for record in parse_single_heart_rate_multi(raw)
+            )
+
+        if records:
+            log.info(
+                f"0x55 history received: {len(records)} records in "
+                f"{packet_count} packets; newest={records[0]['timestamp']}, "
+                f"oldest={records[-1]['timestamp']}"
+            )
+        else:
+            log.info("No scheduled HR record is available yet.")
+        return records
+
+    def _load_scheduled_hr_state(self) -> Optional[dict]:
+        if not self._scheduled_hr_state_file.exists():
+            return None
+        try:
+            state = json.loads(self._scheduled_hr_state_file.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning(f"Could not read scheduled HR checkpoint: {exc}")
+            return None
+
+        if state.get("device_address") != self.address:
+            return None
+        if not isinstance(state.get("last_timestamp"), str):
+            return None
+        return state
+
+    def _load_scheduled_hr_keys(self) -> set[tuple[str, str]]:
+        if self._scheduled_hr_keys is not None:
+            return self._scheduled_hr_keys
+
+        keys = set()
+        if self._scheduled_hr_records_file.exists():
+            try:
+                with self._scheduled_hr_records_file.open() as records_file:
+                    for line_number, line in enumerate(records_file, start=1):
+                        try:
+                            record = json.loads(line)
+                            keys.add((
+                                record["device_address"],
+                                record["timestamp"],
+                            ))
+                        except (KeyError, TypeError, json.JSONDecodeError):
+                            log.warning(
+                                f"Ignoring malformed scheduled HR JSONL line "
+                                f"{line_number}"
+                            )
+            except OSError as exc:
+                log.warning(f"Could not load scheduled HR records: {exc}")
+
+        self._scheduled_hr_keys = keys
+        return keys
+
+    def _write_scheduled_hr_state(self, record: dict) -> None:
+        state = {
+            "device_address": self.address,
+            "last_timestamp": record["timestamp"],
+            "source_record_id": record["record_id"],
+            "updated_at": _now(),
+        }
+        temp_file = self._scheduled_hr_state_file.with_suffix(".json.tmp")
+        with temp_file.open("w") as state_file:
+            json.dump(state, state_file, indent=2)
+            state_file.write("\n")
+            state_file.flush()
+            os.fsync(state_file.fileno())
+        os.replace(temp_file, self._scheduled_hr_state_file)
+
+    def _persist_scheduled_hr_record(self, record: dict) -> bool:
+        """
+        Persist one record before advancing the checkpoint.
+
+        Returns True when a new JSONL line was appended, False when the record
+        was already present. The checkpoint is updated in both cases.
+        """
+        key = (self.address, record["timestamp"])
+        keys = self._load_scheduled_hr_keys()
+        appended = key not in keys
+
+        if appended:
+            stored_record = {
+                "device_address": self.address,
+                "record_id": record["record_id"],
+                "timestamp": record["timestamp"],
+                "heart_rate": record["heart_rate"],
+                "captured_at": _now(),
+            }
+            with self._scheduled_hr_records_file.open("a") as records_file:
+                records_file.write(
+                    json.dumps(stored_record, separators=(",", ":")) + "\n"
+                )
+                records_file.flush()
+                os.fsync(records_file.fileno())
+            keys.add(key)
+
+        self._write_scheduled_hr_state(record)
+        return appended
+
+    async def collect_new_scheduled_heart_rate_records(
+        self,
+        minimum_timestamp: Optional[datetime] = None,
+    ) -> list:
+        """
+        Read the 0x55 history burst and persist records newer than the checkpoint.
+
+        Timestamp is the durable identity. The firmware recalculates IDs as
+        relative positions (newest record is always ID 0), so IDs cannot be
+        used to detect gaps across queries.
+        """
+        history = await self.get_scheduled_heart_rate_history()
+        if not history:
+            return []
+
+        state = self._load_scheduled_hr_state()
+        cutoff = minimum_timestamp
+        if state is not None:
+            try:
+                cutoff = datetime.strptime(
+                    state["last_timestamp"], "%Y-%m-%d %H:%M:%S"
+                )
+            except ValueError:
+                log.warning("Invalid scheduled HR checkpoint timestamp.")
+                return []
+
+        parsed = {}
+        for record in history:
+            try:
+                record_dt = datetime.strptime(
+                    record["timestamp"], "%Y-%m-%d %H:%M:%S"
+                )
+            except ValueError:
+                continue
+            parsed.setdefault(record_dt, record)
+
+        if not parsed:
+            log.warning("0x55 history did not contain valid timestamps.")
+            return []
+
+        if cutoff is None:
+            cutoff = max(parsed) - timedelta(microseconds=1)
+
+        new_records = [
+            (record_dt, record)
+            for record_dt, record in parsed.items()
+            if record_dt > cutoff
+        ]
+        new_records.sort(key=lambda item: item[0])
+
+        collected = []
+        for _, record in new_records:
+            if self._persist_scheduled_hr_record(record):
+                collected.append(record)
+                log.info(
+                    f"Scheduled HR [{record['timestamp']}] "
+                    f"{record['heart_rate']} bpm "
+                    f"(source ID {record['record_id']})"
+                )
+
+        if not collected:
+            newest_timestamp = max(parsed).strftime("%Y-%m-%d %H:%M:%S")
+            log.info(
+                f"No new scheduled HR records; newest on device is "
+                f"{newest_timestamp}."
+            )
+        return collected
 
     async def get_all_blood_oxygen(self) -> list:
         """Read all stored SpO2 records."""
@@ -636,6 +906,104 @@ class WristbandClient:
         ok = len(raw) >= 1 and raw[0] == 0x2A and not self._is_no_data(raw)
         log.info(f"⏰ Auto HR {'enabled' if enable else 'disabled'}: {'OK' if ok else 'FAILED'}")
         return ok
+
+    async def run_scheduled_heart_rate_monitor(
+        self,
+        first_wait_seconds: int = SCHEDULED_HR_FIRST_WAIT_SECONDS,
+        poll_seconds: int = SCHEDULED_HR_POLL_SECONDS,
+        max_cycles: Optional[int] = None,
+    ) -> dict:
+        """
+        Configure 0x2A for HR every five minutes and collect 0x55 records.
+
+        The first post-configuration read happens after one minute. Later reads
+        happen every minute so newly completed measurements are retrieved with
+        low latency. A persisted timestamp checkpoint allows every newer record
+        to be recovered after a restart or BLE disconnection.
+        """
+        if first_wait_seconds < 0 or poll_seconds < 0:
+            raise ValueError("Monitor delays cannot be negative")
+
+        log.info("Starting scheduled HR acquisition (0x2A + 0x55).")
+        if not await self.sync_time(timezone_minutes=-300):
+            raise RuntimeError("Could not synchronize wristband time")
+
+        configured = await self.set_auto_heart_rate(
+            enable=True,
+            start_hour=0,
+            end_hour=23,
+            interval_minutes=self.SCHEDULED_HR_INTERVAL_MINUTES,
+            all_week=True,
+        )
+        if not configured:
+            raise RuntimeError("Could not configure scheduled HR acquisition")
+
+        log.info(
+            "Auto HR configured: every 5 min, 00:00-23:59, all week. "
+            "The schedule remains active when this monitor stops."
+        )
+        session_start = datetime.now().replace(microsecond=0) - timedelta(seconds=2)
+
+        collected_count = 0
+        cycles = 0
+
+        async def collect_with_reconnect(
+            minimum_timestamp: Optional[datetime] = None,
+        ) -> list:
+            while True:
+                try:
+                    return await self.collect_new_scheduled_heart_rate_records(
+                        minimum_timestamp=minimum_timestamp,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except (BleakError, TimeoutError, RuntimeError) as exc:
+                    log.warning(
+                        f"Scheduled HR read failed: {exc}. Reconnecting."
+                    )
+                    if self._client:
+                        try:
+                            await self._client.disconnect()
+                        except Exception:
+                            pass
+                    self._client = None
+                    await self._reconnect_until_connected()
+
+        # Recover records produced while the application was not running before
+        # waiting for the first new measurement from this configuration cycle.
+        had_checkpoint = self._load_scheduled_hr_state() is not None
+        if had_checkpoint:
+            recovered = await collect_with_reconnect()
+            collected_count += len(recovered)
+
+        if first_wait_seconds:
+            log.info(
+                f"Waiting {first_wait_seconds}s for the first one-minute "
+                "measurement to finish..."
+            )
+            await asyncio.sleep(first_wait_seconds)
+
+        while max_cycles is None or cycles < max_cycles:
+            records = await collect_with_reconnect(
+                minimum_timestamp=None if had_checkpoint else session_start
+            )
+            collected_count += len(records)
+            cycles += 1
+
+            if max_cycles is not None and cycles >= max_cycles:
+                break
+            log.info(
+                f"Next scheduled HR query in {poll_seconds}s "
+                f"(records saved: {collected_count})."
+            )
+            await asyncio.sleep(poll_seconds)
+
+        return {
+            "cycles": cycles,
+            "records_saved": collected_count,
+            "records_file": str(self._scheduled_hr_records_file),
+            "checkpoint_file": str(self._scheduled_hr_state_file),
+        }
 
     async def set_auto_spo2(
         self,

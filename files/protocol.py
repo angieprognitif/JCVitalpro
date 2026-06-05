@@ -222,6 +222,28 @@ def pkt_get_heart_rate_data(mode: int = 0, id_high: int = 0, id_low: int = 0) ->
     return build_packet(CMD_GET_HEART_RATE, bytes([mode, id_high, id_low]))
 
 
+def pkt_get_single_heart_rate(mode: int = 0x00, record_id: int = 0) -> bytes:
+    """
+    Command 0x55 — Read one scheduled heart-rate record.
+
+    mode:
+        0x00 = start history download (firmware streams newest first)
+        0x01 = start at the specified relative position
+        0x99 = delete stored records
+
+    Positions are transmitted little-endian as ID1, ID2. On the observed
+    firmware they are not durable IDs: the newest record is position zero.
+    """
+    if mode not in (0x00, 0x01, 0x99):
+        raise ValueError(f"Unsupported 0x55 mode: {mode:#04x}")
+    if not 0 <= record_id <= 0xFFFF:
+        raise ValueError(f"Record ID out of range: {record_id}")
+
+    id1 = record_id & 0xFF
+    id2 = (record_id >> 8) & 0xFF
+    return build_packet(CMD_GET_SINGLE_HR, bytes([mode, id1, id2]))
+
+
 def pkt_get_blood_oxygen(mode: int = 0, id_high: int = 0, id_low: int = 0) -> bytes:
     """mode: 0=latest, 1=at location, 2=continue"""
     return build_packet(CMD_GET_BLOOD_OXYGEN, bytes([mode, id_high, id_low]))
@@ -324,6 +346,13 @@ class HeartRateRecord:
     record_id: int
     timestamp: str
     values: list    # up to 15 per-minute values
+
+
+@dataclass
+class SingleHeartRateRecord:
+    record_id: int
+    timestamp: str
+    heart_rate: int
 
 
 @dataclass
@@ -508,6 +537,66 @@ def parse_heart_rate_data(data: bytes) -> Optional[HeartRateRecord]:
     ts     = _parse_timestamp(data, 3)
     values = [v for v in data[9:24] if v > 0]
     return HeartRateRecord(rid, ts, values)
+
+
+SINGLE_HR_RECORD_SIZE = 10
+
+
+def parse_single_heart_rate(
+    data: bytes,
+    offset: int = 0,
+) -> Optional[SingleHeartRateRecord]:
+    """
+    Parse one scheduled HR record:
+    [0x55][ID1][ID2][YY][MM][DD][HH][mm][SS][HR].
+
+    These records do not include a per-record CRC.
+    """
+    if len(data) < offset + SINGLE_HR_RECORD_SIZE:
+        return None
+    d = data[offset:offset + SINGLE_HR_RECORD_SIZE]
+    if d[0] != CMD_GET_SINGLE_HR:
+        return None
+    if any(
+        (value >> 4) > 9 or (value & 0x0F) > 9
+        for value in d[3:9]
+    ):
+        return None
+
+    try:
+        timestamp = datetime(
+            2000 + from_bcd(d[3]),
+            from_bcd(d[4]),
+            from_bcd(d[5]),
+            from_bcd(d[6]),
+            from_bcd(d[7]),
+            from_bcd(d[8]),
+        ).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+    return SingleHeartRateRecord(
+        record_id=d[1] | (d[2] << 8),
+        timestamp=timestamp,
+        heart_rate=d[9],
+    )
+
+
+def parse_single_heart_rate_multi(data: bytes) -> list:
+    """Extract all concatenated 10-byte 0x55 records from a notification."""
+    records = []
+    offset = 0
+    while offset + SINGLE_HR_RECORD_SIZE <= len(data):
+        if data[offset] != CMD_GET_SINGLE_HR:
+            offset += 1
+            continue
+        record = parse_single_heart_rate(data, offset)
+        if record:
+            records.append(record)
+            offset += SINGLE_HR_RECORD_SIZE
+        else:
+            offset += 1
+    return records
 
 
 def parse_blood_oxygen(data: bytes) -> Optional[BloodOxygenRecord]:

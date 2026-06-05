@@ -78,8 +78,29 @@ MENU = """
  ── Experiments ─────────────────────────
  19) Test minimum PPI interval (sets 1-min, waits, measures gap)
  20) ★ Probe 0x28 01 — is it real HRV or just HR? (3 min capture)
+ ── Scheduled acquisition ────────────────
+ 21) Scheduled HR every 5 min (0x2A + 0x55)
   q) Quit
 """
+
+
+async def _wait_for_enter(prompt: str) -> None:
+    """Wait for one stdin line without blocking the asyncio event loop."""
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+
+    def on_stdin_ready():
+        sys.stdin.readline()
+        if not done.done():
+            done.set_result(None)
+
+    print(prompt, flush=True)
+    loop.add_reader(sys.stdin.fileno(), on_stdin_ready)
+    try:
+        await done
+    finally:
+        loop.remove_reader(sys.stdin.fileno())
+
 
 async def interactive(address: str):
     print(f"\n🔗 Connecting to {address}…")
@@ -232,6 +253,46 @@ async def interactive(address: str):
                     status = info['values'] if info['any_nonzero_after_30s'] else 'always 0'
                     print(f"  {bp}: {status}")
                 print(f"\n🔬 CONCLUSION: {r.get('conclusion')}")
+            elif choice == "21":
+                print(
+                    "\nThis will configure HR every 5 minutes for the full day.\n"
+                    "The first query runs after 1 minute; later queries run "
+                    "every minute.\n"
+                    "Records are saved in data/scheduled_hr_records.jsonl."
+                )
+                monitor_task = asyncio.create_task(
+                    wb.run_scheduled_heart_rate_monitor()
+                )
+                stop_task = asyncio.create_task(
+                    _wait_for_enter("\nPress ENTER to stop monitoring and return to the menu.")
+                )
+                done, _ = await asyncio.wait(
+                    {monitor_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if stop_task in done:
+                    monitor_task.cancel()
+                    try:
+                        await monitor_task
+                    except asyncio.CancelledError:
+                        pass
+                    print(
+                        "\nMonitoring stopped. The 5-minute schedule remains "
+                        "active on the wristband."
+                    )
+                else:
+                    stop_task.cancel()
+                    try:
+                        await stop_task
+                    except asyncio.CancelledError:
+                        pass
+                    try:
+                        result = monitor_task.result()
+                    except Exception as exc:
+                        print(f"\n❌ Scheduled HR monitor failed: {exc}")
+                    else:
+                        _pretty(result)
             else:
                 print("Unknown option.")
 
